@@ -1,5 +1,9 @@
 FROM node:24-alpine
 
+ARG JET_BROWSER_RUNTIME_IMAGE=ghcr.io/masakaai/jet-browser@sha256:5884204e128a3e5bb17634078affdf28d1933d2745752cee3bc74235ed316cec
+ARG TARGETPLATFORM
+ARG JET_BROWSER_RUNTIME_PLATFORM
+
 ENV NODE_ENV=production
 WORKDIR /app
 
@@ -9,8 +13,16 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 COPY integrations/mcp/server.mjs ./integrations/mcp/server.mjs
+COPY integrations/mcp/runtime-config.mjs ./integrations/mcp/runtime-config.mjs
+COPY scripts/render-mcp-runtime-config.mjs ./scripts/render-mcp-runtime-config.mjs
 COPY scripts/standalone-runner.mjs scripts/standalone-readiness.mjs ./scripts/
 COPY seccomp_profile.json ./seccomp_profile.json
+RUN runtime_platform="${JET_BROWSER_RUNTIME_PLATFORM:-$TARGETPLATFORM}" && \
+    node scripts/render-mcp-runtime-config.mjs \
+      integrations/mcp/runtime-config.mjs \
+      "$JET_BROWSER_RUNTIME_IMAGE" \
+      "$runtime_platform" && \
+    rm scripts/render-mcp-runtime-config.mjs
 
 LABEL org.opencontainers.image.source="https://github.com/masakaai/jet-browser" \
       org.opencontainers.image.description="Bounded MCP verifier for the Jet Browser WPE WebKit runtime" \

@@ -1,6 +1,6 @@
 # Jet Browser MCP verifier
 
-This local stdio server gives an MCP client one narrow way to verify Jet Browser. It starts the immutable public `linux/amd64` image, disables browser networking, opens the image's local fixture, types through native input, checks the DOM, captures a fresh PNG, and cleans up.
+This local stdio server gives an MCP client one narrow way to verify Jet Browser. Its multi-platform package selects a native `linux/amd64` or `linux/arm64` image, disables browser networking, opens the image's local fixture, types through native input, checks the DOM, captures a fresh PNG, and cleans up.
 
 It is a runtime verifier, not a general browsing server. It does not expose public-web navigation, CDP, personal browser profiles, credentials, a hosted service, or telemetry.
 
@@ -8,7 +8,7 @@ It is a runtime verifier, not a general browsing server. It does not expose publ
 
 - Node.js 24+
 - Docker
-- An x86_64 host, or Docker amd64 emulation
+- An x86_64 or ARM64 Linux host
 
 The first verification may pull the public image from GHCR. Browser execution itself uses Docker's `--network=none` boundary. The image is pinned by digest in [`server.mjs`](./server.mjs).
 
@@ -22,9 +22,9 @@ The versioned MCP image starts the stdio server directly. It needs the Docker so
     "jet-browser": {
       "command": "docker",
       "args": [
-        "run", "--rm", "-i", "--platform=linux/amd64", "--network=none",
+        "run", "--rm", "-i", "--network=none",
         "--mount", "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock",
-        "ghcr.io/masakaai/jet-browser-mcp:0.8.0"
+        "ghcr.io/masakaai/jet-browser-mcp:0.9.0"
       ]
     }
   }
@@ -76,7 +76,7 @@ A successful call returns structured content like:
   "title": "Jet Browser Ready",
   "input": "open-source runtime",
   "screenshotBytes": 2048,
-  "image": "ghcr.io/masakaai/jet-browser@sha256:540a1fec531bf71b62c2c2d030c033249955ffc192ab7e0e7a1ac8d8412a661b"
+  "image": "ghcr.io/masakaai/jet-browser@sha256:5884204e128a3e5bb17634078affdf28d1933d2745752cee3bc74235ed316cec"
 }
 ~~~
 
@@ -93,8 +93,7 @@ node --test test/mcp-server.test.mjs
 The repository's standalone CI remains the end-to-end runtime proof. To execute that same Docker acceptance locally:
 
 ~~~bash
-DOCKER_DEFAULT_PLATFORM=linux/amd64 \
-JET_BROWSER_IMAGE=ghcr.io/masakaai/jet-browser@sha256:540a1fec531bf71b62c2c2d030c033249955ffc192ab7e0e7a1ac8d8412a661b \
+JET_BROWSER_IMAGE=ghcr.io/masakaai/jet-browser@sha256:5884204e128a3e5bb17634078affdf28d1933d2745752cee3bc74235ed316cec \
 npm run standalone:smoke
 ~~~
 

@@ -224,15 +224,15 @@ async function verifyCdpRuntime(url, { started, sampleMemory }) {
 }
 
 async function jetSample({ image, name }) {
-  await createContainer(name, image, [
+  const started = performance.now();
+  const child = spawn(process.env.DOCKER || 'docker', [
+    'run', '--rm', '-i', '--name', name, '--network=none', ...resourceArgs,
     '--cap-drop=ALL', '--cap-add=SETUID', '--cap-add=SETGID',
     '--security-opt=no-new-privileges', '--security-opt=systempaths=unconfined',
     '--security-opt=apparmor=unconfined',
     '--security-opt=seccomp=' + resolve('seccomp_profile.json'),
-    '--env=JET_BROWSER_SMOKE=1', '-i',
-  ]);
-  const started = performance.now();
-  const child = spawn(process.env.DOCKER || 'docker', ['start', '-a', '-i', name], { stdio: ['pipe', 'pipe', 'pipe'] });
+    '--env=JET_BROWSER_SMOKE=1', image,
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
   const lines = new LineQueue(child.stdout);
   let stderr = '';
   child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4000); });
@@ -240,40 +240,46 @@ async function jetSample({ image, name }) {
     child.once('error', reject);
       child.once('close', code => code ? reject(Error(`Jet Browser exited ${code}: ${stderr}`)) : resolvePromise());
   });
-  const commands = [
-    { op: 'create', proxy: null, profile_dir: null, page_load_strategy: 'eager' },
-    { op: 'navigate', url: 'http://127.0.0.1:8080/' },
-    { op: 'title' },
-    { op: 'evaluate', expression: "({title:document.title,marker:document.querySelector('#result')?.id||null})" },
-    { op: 'evaluate', expression: 'document.title' },
-    { op: 'screenshot' },
-    { op: 'evaluate', expression: '(()=>{const until=Date.now()+5000;while(Date.now()<until){};return true})()' },
-    { op: 'close' },
-  ];
-  child.stdin.end(commands.map(commandValue => JSON.stringify(commandValue)).join('\n') + '\n');
   const receive = async () => {
     const response = JSON.parse(await lines.next());
-    if (!response.ok) throw Error(response.error || 'Jet Browser command failed');
+    if (!response.ok) {
+      const diagnostic = stderr.trim().slice(-400);
+      throw Error(`${response.error || 'Jet Browser command failed'}${diagnostic ? `; runtime stderr: ${diagnostic}` : ''}`);
+    }
     return response.value;
   };
+  const send = async commandValue => {
+    await new Promise((resolvePromise, reject) => {
+      child.stdin.write(JSON.stringify(commandValue) + '\n', error => error ? reject(error) : resolvePromise());
+    });
+    return receive();
+  };
   try {
-    await receive();
-    await receive();
-    const title = await receive();
-    const verified = await receive();
-    const value = verified?.result?.value ?? verified?.value ?? verified;
+    await send({ op: 'create', proxy: null, profile_dir: null, page_load_strategy: 'none' });
+    await send({ op: 'navigate', url: 'http://127.0.0.1:8080/' });
+    let title;
+    let value;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      title = await send({ op: 'title' });
+      const verified = await send({ op: 'evaluate', expression: "({title:document.title,marker:document.querySelector('#result')?.id||null})" });
+      value = verified?.result?.value ?? verified?.value ?? verified;
+      if (title === 'Jet Browser Ready' && value?.title === title && value.marker === 'result') break;
+      await sleep(20);
+    }
     if (title !== 'Jet Browser Ready' || value?.title !== title || value.marker !== 'result') throw Error('Jet Browser fixture verification failed');
     const browserReadyMs = Number((performance.now() - started).toFixed(2));
-    const check = await receive();
+    const check = await send({ op: 'evaluate', expression: 'document.title' });
     const checkValue = check?.result?.value ?? check?.value ?? check;
     if (checkValue !== title) throw Error('Jet Browser script verification failed');
-    const screenshot = await receive();
+    const screenshot = await send({ op: 'screenshot' });
     if (Buffer.from(screenshot || '', 'base64').length < 1000) throw Error('Jet Browser screenshot verification failed');
+    const heldPromise = send({ op: 'evaluate', expression: '(()=>{const until=Date.now()+5000;while(Date.now()<until){};return true})()' });
     const memory = await activeMemoryMiB(name);
-    const held=await receive();
-    const heldValue=held?.result?.value ?? held?.value ?? held;
-    if(heldValue!==true)throw Error('Jet Browser memory sampling hold failed');
-    await receive();
+    const held = await heldPromise;
+    const heldValue = held?.result?.value ?? held?.value ?? held;
+    if (heldValue !== true) throw Error('Jet Browser memory sampling hold failed');
+    await send({ op: 'close' });
+    child.stdin.end();
     await completion;
     return { status: 'passed', browserReadyMs, scriptVerified: true, activeMemoryMiB: memory };
   } finally {
@@ -477,7 +483,7 @@ export async function runRuntimeSuite({ providers, runs, warmups, images, commit
       memoryLimitMiB: 1024,
       viewport: { width: 1280, height: 800 },
       networkTarget: 'container-local fixture only',
-      browserReady: 'docker start to verified title and DOM marker',
+      browserReady: 'docker run invocation to verified title and DOM marker',
       memory: 'Docker working-set snapshot after title, DOM, script, and screenshot verification while the browser remained active',
       order: providers,
     },

@@ -1,23 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 
 const read = path => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 
 test('MCP OCI package is registry-owned, network-disabled, and version-aligned', async () => {
-  const [dockerfile, metadataText, packageText, workflow, readme, smoke] = await Promise.all([
+  const [dockerfile, metadataText, packageText, workflow, readme, smoke, runtimeConfig, renderer, verifiedReleaseText] = await Promise.all([
     read('Dockerfile.mcp'),
     read('server.json'),
     read('package.json'),
     read('.github/workflows/publish-container.yml'),
     read('integrations/mcp/README.md'),
     read('scripts/mcp-container-smoke.mjs'),
+    read('integrations/mcp/runtime-config.mjs'),
+    read('scripts/render-mcp-runtime-config.mjs'),
+    read('scripts/verified-release.json'),
   ]);
   const metadata = JSON.parse(metadataText);
   const packageJson = JSON.parse(packageText);
+  const verifiedRelease = JSON.parse(verifiedReleaseText);
   const mcpPackage = metadata.packages[0];
 
   assert.equal(metadata.name, 'io.github.masakaai/jet-browser');
+  assert.match(verifiedRelease.mcpImageDigest, /^sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(Object.keys(verifiedRelease.mcpPlatformDigests).sort(), ['linux/amd64', 'linux/arm64']);
   assert.equal(metadata.version, packageJson.version);
   assert.ok(metadata.description.length <= 100);
   assert.equal(mcpPackage.registryType, 'oci');
@@ -25,26 +32,38 @@ test('MCP OCI package is registry-owned, network-disabled, and version-aligned',
   assert.equal(mcpPackage.identifier, `ghcr.io/masakaai/jet-browser-mcp:${packageJson.version}`);
   assert.equal(mcpPackage.transport.type, 'stdio');
   assert.deepEqual(mcpPackage.runtimeArguments.map(({ name, value }) => [name, value]), [
-    ['--platform', 'linux/amd64'],
     ['--network', 'none'],
     ['--mount', 'type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock'],
   ]);
 
   assert.match(dockerfile, /^FROM node:24-alpine$/m);
   assert.match(dockerfile, /apk add --no-cache docker-cli/);
+  assert.match(dockerfile, /ARG JET_BROWSER_RUNTIME_IMAGE=/);
+  assert.match(dockerfile, /ARG TARGETPLATFORM/);
+  assert.match(dockerfile, /JET_BROWSER_RUNTIME_PLATFORM:-\$TARGETPLATFORM/);
+  assert.doesNotMatch(dockerfile, /ARG JET_BROWSER_RUNTIME_PLATFORM=linux\/amd64/);
+  assert.match(dockerfile, /render-mcp-runtime-config\.mjs/);
   assert.match(dockerfile, /io\.modelcontextprotocol\.server\.name="io\.github\.masakaai\/jet-browser"/);
   assert.match(dockerfile, /ENTRYPOINT \["node", "integrations\/mcp\/server\.mjs"\]/);
   assert.doesNotMatch(dockerfile, /COPY \. \.|docker:dind|dockerd/);
 
-  assert.match(workflow, /MCP_IMAGE_NAME: \$\{\{ github\.repository \}\}-mcp/);
+  assert.match(workflow, /meta-images: ghcr\.io\/\$\{\{ github\.repository \}\}-mcp/);
   assert.match(workflow, /file: \.\/Dockerfile\.mcp/);
-  assert.match(workflow, /subject-name: \$\{\{ env\.REGISTRY \}\}\/\$\{\{ env\.MCP_IMAGE_NAME \}\}/);
+  assert.match(workflow, /JET_BROWSER_RUNTIME_IMAGE=ghcr\.io\/\$\{\{ github\.repository \}\}@\$\{\{ needs\.publish-runtime\.outputs\.digest \}\}/);
   assert.match(readme, /Docker socket grants host-level control/);
-  assert.match(readme, /--platform=linux\/amd64/);
+  assert.match(readme, /linux\/amd64/);
+  assert.match(readme, /linux\/arm64/);
+  assert.doesNotMatch(readme, /--platform=linux\/amd64/);
   assert.match(readme, /--network=none/);
   assert.match(smoke, /name: 'jet_browser_verify'/);
+  assert.match(smoke, /linux\/arm64/);
   assert.match(smoke, /leftoverVerifierContainers/);
   assert.match(smoke, /type=bind,src=\/var\/run\/docker\.sock,dst=\/var\/run\/docker\.sock/);
+  assert.match(runtimeConfig, new RegExp(`JET_BROWSER_IMAGE = 'ghcr\\.io/masakaai/jet-browser@${verifiedRelease.runtimeImageDigest}'`));
+  assert.match(runtimeConfig, /process\.arch/);
+  assert.match(runtimeConfig, /x64: 'linux\/amd64'/);
+  assert.match(runtimeConfig, /arm64: 'linux\/arm64'/);
+  assert.match(renderer, /linux\\\/\(amd64\|arm64\)/);
 });
 
 test('README Cursor install link preserves the reviewed MCP runtime boundary', async () => {
@@ -67,7 +86,7 @@ test('README Cursor install link preserves the reviewed MCP runtime boundary', a
   assert.deepEqual(config, {
     command: 'docker',
     args: [
-      'run', '--rm', '-i', '--platform=linux/amd64', '--network=none',
+      'run', '--rm', '-i', '--network=none',
       '--mount', 'type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock',
       `ghcr.io/masakaai/jet-browser-mcp:${packageJson.version}`,
     ],
@@ -94,9 +113,68 @@ test('README VS Code install link preserves the reviewed MCP runtime boundary', 
     name: 'jet-browser',
     command: 'docker',
     args: [
-      'run', '--rm', '-i', '--platform=linux/amd64', '--network=none',
+      'run', '--rm', '-i', '--network=none',
       '--mount', 'type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock',
       `ghcr.io/masakaai/jet-browser-mcp:${packageJson.version}`,
     ],
   });
+});
+
+test('successful stable releases publish exact metadata to the official MCP Registry', async () => {
+  const [workflow, metadataText] = await Promise.all([
+    read('.github/workflows/publish-mcp-registry.yml'),
+    read('server.json'),
+  ]);
+  const metadata = JSON.parse(metadataText);
+  const image = metadata.packages.find(({ registryType }) => registryType === 'oci').identifier;
+  const filter = workflow.match(/^\s+REGISTRY_ACTIVE_FILTER: '(.+)'$/m)?.[1]?.replaceAll("''", "'");
+
+  assert.match(workflow, /^name: publish-mcp-registry$/m);
+  assert.match(workflow, /^  workflow_run:\s*\n\s+workflows: \[publish-container\]\s*\n\s+types: \[completed\]/m);
+  assert.match(workflow, /^  workflow_dispatch:/m);
+  assert.match(workflow, /github\.event\.workflow_run\.conclusion == 'success'/);
+  assert.match(workflow, /github\.event\.workflow_run\.event == 'release'/);
+  assert.match(workflow, /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1/);
+  assert.match(workflow, /^\s+contents: read$/m);
+  assert.match(workflow, /^\s+id-token: write$/m);
+  assert.doesNotMatch(workflow, /packages: write|attestations: write|pull-requests: write/);
+  assert.match(workflow, /MCP_PUBLISHER_VERSION: 1\.8\.1/);
+  assert.match(workflow, /MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc/);
+  assert.match(workflow, /mcp-publisher validate server\.json/);
+  assert.match(workflow, /mcp-publisher login github-oidc/);
+  assert.match(workflow, /mcp-publisher publish server\.json/);
+  assert.match(workflow, /servers\/\$encoded_name\/versions\/\$version/);
+  assert.match(workflow, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SHA"/);
+  assert.match(workflow, /sha256sum --check --strict/);
+  assert.ok(filter, 'workflow must define one reusable exact-record predicate');
+
+  const fixture = {
+    server: metadata,
+    _meta: {
+      'io.modelcontextprotocol.registry/official': {
+        status: 'active',
+        isLatest: true,
+      },
+    },
+  };
+  const evaluate = value => spawnSync('jq', [
+    '-e',
+    '--arg', 'name', metadata.name,
+    '--arg', 'version', metadata.version,
+    '--arg', 'image', image,
+    filter,
+  ], { input: JSON.stringify(value), encoding: 'utf8' });
+
+  assert.equal(evaluate(fixture).status, 0);
+  assert.notEqual(evaluate({ ...fixture, _meta: {
+    'io.modelcontextprotocol.registry/official': { status: 'deleted' },
+  } }).status, 0);
+  assert.notEqual(evaluate({ ...fixture, server: {
+    ...metadata,
+    packages: [{ ...metadata.packages[0], identifier: `${image}-wrong` }],
+  } }).status, 0);
+  assert.notEqual(evaluate({ ...fixture, server: {
+    ...metadata,
+    version: `${metadata.version}-wrong`,
+  } }).status, 0);
 });
